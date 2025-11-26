@@ -452,7 +452,7 @@ except Exception:
 # ---------- Load classic ML ----------
 tfidf_vectorizer = joblib.load("tfidf_vectorizer_smote.pkl")
 models = {
-    "Random Forest": joblib.load("rf_model_smote.pkl"),
+    #"Random Forest": joblib.load("rf_model_smote.pkl"),
     "XGBoost": joblib.load("xgb_model_smote.pkl"),
     "Logistic Regression": joblib.load("lr_model_smote.pkl"),
     "SVM": joblib.load("svm_model_smote.pkl"),
@@ -880,3 +880,4 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
+
