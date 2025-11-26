@@ -9,3 +9,4 @@ nltk
 vaderSentiment
 textblob
 protobuf==3.20.*
+transformers
