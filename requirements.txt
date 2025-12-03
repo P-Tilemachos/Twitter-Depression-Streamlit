@@ -1,13 +1,13 @@
 streamlit
 numpy
 pandas
-matplotlib
 scikit-learn
 xgboost
 joblib
-nltk
+matplotlib
 vaderSentiment
-textblob
-protobuf==3.20.*
 transformers
+requests
 plotly
+tensorflow==2.17.0
+h5py
