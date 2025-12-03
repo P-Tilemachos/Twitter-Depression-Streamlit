@@ -10,4 +10,3 @@ transformers
 requests
 plotly
 h5py
-tensorflow-cpu==2.12.0
