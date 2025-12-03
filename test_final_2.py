@@ -505,6 +505,13 @@ _try_add_text_model(
 
 analyzer = SentimentIntensityAnalyzer()
 
+# ---------- DL status panel ----------
+st.sidebar.markdown("### 🧬 DL Models status")
+if not text_models:
+    st.sidebar.error("No DL models loaded (TensorFlow/Keras not available or load error).")
+else:
+    st.sidebar.success("Loaded DL models: " + ", ".join(text_models.keys()))
+    
 # ---------- Persisted label map ----------
 ALIGN_PATH = pathlib.Path("label_map.json")
 if "label_maps" not in st.session_state:
@@ -883,5 +890,6 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
+
 
 
