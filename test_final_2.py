@@ -22,6 +22,7 @@ import socket
 from email.mime.text import MIMEText
 from collections import Counter
 from datetime import datetime
+from zoneinfo import ZoneInfo  
 
 import numpy as np
 import joblib
@@ -30,6 +31,8 @@ import streamlit as st
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline
 
+# Use fixed time zone: Athens
+TZ = ZoneInfo("Europe/Athens")
 # ---------- Optional for public IP ----------
 try:
     import requests
@@ -639,7 +642,7 @@ if (not is_admin) and (not show_login):
         pub_ip  = get_public_ip()
 
         st.session_state["last_analysis"] = {
-            "timestamp": datetime.now().isoformat(sep=" ", timespec="seconds"),
+            "timestamp": datetime.now(TZ).isoformat(sep=" ", timespec="seconds"),
             "ip": ip_addr,
             "public_ip": pub_ip,
             "text": text,
@@ -880,4 +883,5 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
+
 
