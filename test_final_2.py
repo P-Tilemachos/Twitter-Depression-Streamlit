@@ -396,14 +396,26 @@ st.caption(
 )
 
 # ---------- Transformers sentiment ----------
-try:
-    bert_classifier = pipeline("sentiment-analysis")
-except Exception:
-    bert_classifier = None
+@st.cache_resource(show_spinner=False)
+def load_bert_pipeline():
+    try:
+        return pipeline(
+            "sentiment-analysis",
+            model="distilbert-base-uncased-finetuned-sst-2-english",
+            device=-1,          # CPU
+            truncation=True
+        )
+    except Exception as e:
+        # Προαιρετικά: δείξε 1 φορά το error στο UI για να ξέρεις τι φταίει στο Cloud
+        st.warning(f"BERT sentiment disabled (could not load model): {e}")
+        return None
+
+bert_classifier = load_bert_pipeline()
 
 # ---------- Load classic ML ----------
 tfidf_vectorizer = joblib.load("tfidf_vectorizer_smote.pkl")
 models = {
+    "Random Forest": joblib.load("rf_model_smote.pkl"),
     "XGBoost": joblib.load("xgb_model_smote.pkl"),
     "Logistic Regression": joblib.load("lr_model_smote.pkl"),
     "SVM": joblib.load("svm_model_smote.pkl"),
@@ -581,25 +593,36 @@ if (not is_admin) and (not show_login):
         avg_p_dep = float(np.mean(list(per_model_probs.values()))) if per_model_probs else 0.0
 
         #---------- Sentiment context----------
+        bert_label = "N/A"
+        bert_score = 0.0
+        bert_err   = None
+
         try:
-            bert = bert_classifier(text)[0] if bert_classifier else {"label": "", "score": 0.0}
-        except Exception:
-            bert = {"label": "", "score": 0.0}
-        bert_label   = bert.get("label", "")
+            if bert_classifier is not None:
+                out = bert_classifier(text)
+                if isinstance(out, list) and len(out) > 0:
+                    bert_label = str(out[0].get("label", "N/A") or "N/A")
+                    bert_score = float(out[0].get("score", 0.0) or 0.0)
+        except Exception as e:
+            bert_err = str(e)
+            bert_label = "N/A"
+            bert_score = 0.0
+
         vader_scores = analyzer.polarity_scores(text)
+        vader_lbl    = vader_label_from_scores(vader_scores)
         senti_bucket = sentiment_bucket(bert_label, vader_scores)
 
         sscore  = suicide_score_pct(text)
         ip_addr = get_client_ip_best_effort()
         pub_ip  = get_public_ip()
 
-        #---------- Guardrails ----------
-        vader_lbl            = vader_label_from_scores(vader_scores)
-        is_vader_neg_strong  = (vader_lbl == 'negative')
-        high_suicide_risk    = (sscore >= SUICIDE_GUARD_THR)
-        high_model_conf      = (avg_p_dep >= MODEL_CONF_GUARD_THR)
-        signals_true         = int(sum([is_vader_neg_strong, high_suicide_risk, high_model_conf]))
-        guard_pass           = (signals_true >= 2) if REQUIRE_TWO_SIGNALS else (signals_true >= 1)
+              #---------- Guardrails ----------
+        is_vader_neg_strong = (vader_lbl == "negative")
+        high_suicide_risk   = (sscore >= SUICIDE_GUARD_THR)
+        high_model_conf     = (avg_p_dep >= MODEL_CONF_GUARD_THR)
+
+        signals_true = int(sum([is_vader_neg_strong, high_suicide_risk, high_model_conf]))
+        guard_pass   = (signals_true >= 2) if REQUIRE_TWO_SIGNALS else (signals_true >= 1)
 
         # ✅ Labels persisted
         ensemble_label = "DEPRESSED" if ens_vote == 1 else "NOT DEPRESSED"
@@ -627,7 +650,10 @@ if (not is_admin) and (not show_login):
 
             "sentiment": vader_scores,
             "suicide_score": float(sscore),
-            "bert": {"label": bert_label, "score": float(bert.get("score", 0.0))},
+
+            # ✅ BERT stored properly
+            "bert": {"label": bert_label, "score": float(bert_score)},
+
             "label_maps": st.session_state["label_maps"],
         }
 
@@ -667,14 +693,14 @@ if (not is_admin) and (not show_login):
         #---------- Email to admin ----------
         subject = "[AI-Depression] New analysis snapshot"
         mood_txt = vader_lbl.upper()
-        decision_txt = final_label  # ✅ use final decision
+        decision_txt = final_label
 
         body = (
             f"Timestamp: {st.session_state['last_analysis']['timestamp']}\n"
             f"Local IP: {ip_addr}\n"
             f"Public IP: {pub_ip}\n"
             f"Summary mood (VADER): {mood_txt} (compound={vader_scores.get('compound',0.0):.3f})\n"
-            f"BERT Sentiment: {bert_label} (conf={bert.get('score',0.0)*100:.1f}%)\n"
+            f"BERT Sentiment: {bert_label} (conf={bert_score*100:.1f}%)\n"
             f"Ensemble decision: {decision_txt} (avg p_dep={avg_p_dep*100:.1f}%)\n"
             f"Guardrails pass: {guard_pass} (signals={signals_true})\n"
             f"Suicide risk score: {sscore:.2f}%\n"
@@ -685,9 +711,11 @@ if (not is_admin) and (not show_login):
             ])
             + "\n\nUser text: " + text + "\n"
         )
+
         ok, msg = send_email_to_admin(subject, body)
         if EMAIL_ENABLED:
             st.caption(f"Admin email notification: {'OK' if ok else msg}")
+
 
 # ============================ ADMIN VIEW ============================
 elif is_admin:
@@ -858,4 +886,3 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
-
