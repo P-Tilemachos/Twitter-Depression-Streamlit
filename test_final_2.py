@@ -407,7 +407,7 @@ def load_bert_pipeline():
         )
     except Exception as e:
         # Προαιρετικά: δείξε 1 φορά το error στο UI για να ξέρεις τι φταίει στο Cloud
-        st.warning(f"BERT sentiment disabled (could not load model): {e}")
+        # Silent fallback – BERT unavailable in this environment        
         return None
 
 bert_classifier = load_bert_pipeline()
@@ -886,4 +886,5 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
+
 
