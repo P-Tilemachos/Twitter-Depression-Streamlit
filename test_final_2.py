@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-test_final_2.py
-AI Depression Detector (Final Thesis Version — DL-ready, no debug UI)
+test_final_2.py  (FIXED)
+AI Depression Detector (Final Thesis Version — DL-ready)
 - TF-IDF + ML models (RF, XGB, LR, SVM, NB)
 - Deep Learning text models (CNN, BiLSTM) with safe loader (.h5/.keras)
 - Tokenizers (.pkl/.json)
@@ -9,8 +9,14 @@ AI Depression Detector (Final Thesis Version — DL-ready, no debug UI)
 - Ensemble decision + guardrails
 - VADER + BERT sentiment (messaging)
 - Admin view: per-model details, suicide-risk viz, TF-IDF explain
+
+✅ FIXES / MODS:
+1) All ensemble/guard outputs are persisted safely inside st.session_state["last_analysis"]
+2) Admin View reads ONLY from st.session_state["last_analysis"] using .get() to avoid NameError
+3) Added explicit keys: ensemble_label, final_label, guard_pass, signals_true, vader_label, senti_bucket
 """
 
+#--------------------------------------Imports--------------------------------------
 import os
 import json
 import math
@@ -22,7 +28,6 @@ import socket
 from email.mime.text import MIMEText
 from collections import Counter
 from datetime import datetime
-from zoneinfo import ZoneInfo  
 
 import numpy as np
 import joblib
@@ -30,9 +35,6 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline
-
-# Use fixed time zone: Athens
-TZ = ZoneInfo("Europe/Athens")
 
 # ---------- Optional for public IP ----------
 try:
@@ -70,73 +72,41 @@ SUICIDE_KEYWORDS = {
     "death", "self-harm", "cut", "end", "end it", "no reason to live"
 }
 SUICIDE_PHRASES = {
-    "strong": [  # explicit / direct intention
-        "i want to die",
-        "want to die",
-        "kill myself",
-        "end my life",
-        "end it all",
-        "no reason to live",
-        "don't want to live",
-        "dont want to live",
-        "better off dead",
-        "wish i were dead",
-        "i wish i was dead",
-        "i want to disappear forever",
-        "i don't want to exist",
-        "i dont want to exist"
+    "strong": [
+        "i want to die", "want to die", "kill myself", "end my life", "end it all",
+        "no reason to live", "don't want to live", "dont want to live",
+        "better off dead", "wish i were dead", "i wish i was dead",
+        "i want to disappear forever", "i don't want to exist", "i dont want to exist"
     ],
-    "medium": [  # intense despair / hidden idea
-        "tired of life",
-        "sick of life",
-        "i can't go on",
-        "i cant go on",
-        "i can't do this anymore",
-        "i cant do this anymore",
-        "i give up",
-        "i'm done with everything",
-        "im done with everything",
-        "nothing to live for",
-        "don't see a future",
-        "dont see a future",
-        "life has no meaning",
-        "everything has lost its meaning",
-        "no point in trying",
-        "empty inside",
-        "completely empty",
-        "lost all hope",
-        "no hope left",
-        "better off without me",
+    "medium": [
+        "tired of life", "sick of life", "i can't go on", "i cant go on",
+        "i can't do this anymore", "i cant do this anymore",
+        "i give up", "i'm done with everything", "im done with everything",
+        "nothing to live for", "don't see a future", "dont see a future",
+        "life has no meaning", "everything has lost its meaning",
+        "no point in trying", "empty inside", "completely empty",
+        "lost all hope", "no hope left", "better off without me",
         "everyone would be better off without me",
-        "no purpose in waking up",
-        "purpose in waking up",
-        "no point in waking up",
-        "waiting for the end",
-        "just waiting for the end"
+        "no purpose in waking up", "purpose in waking up", "no point in waking up",
+        "waiting for the end", "just waiting for the end"
     ],
-    "weak": [  # severe depression/exhaustion
-        "no strength anymore",
-        "i have no strength anymore",
-        "so tired of everything",
-        "exhausted by life",
-        "i feel numb",
-        "i feel empty",
-        "i don't care about anything",
-        "i dont care about anything",
-        "can't get out of bed",
-        "cant get out of bed",
-        "don't feel anything",
-        "dont feel anything",
-        "life is too hard",
-        "life is overwhelming",
-        "overwhelmed by life"
+    "weak": [
+        "no strength anymore", "i have no strength anymore", "so tired of everything",
+        "exhausted by life", "i feel numb", "i feel empty",
+        "i don't care about anything", "i dont care about anything",
+        "can't get out of bed", "cant get out of bed",
+        "don't feel anything", "dont feel anything",
+        "life is too hard", "life is overwhelming", "overwhelmed by life"
     ]
 }
+
+#------Color Palettes------
 COLOR_PALETTES = {
     "positive": ["#FFF5BA", "#FFD580", "#FFC1CC"],
     "neutral":  ["#B0C4DE", "#D8BFD8", "#FAF3E0"],
     "negative": ["#1B1A1E", "#4E4C4C", "#2F4F4F"]
 }
+#------Motivation Messages------
 MOTIVATIONALS = [
     "🌟 You are stronger than you think!",
     "💪 Keep pushing forward.",
@@ -147,7 +117,7 @@ MOTIVATIONALS = [
     "🙌 Keep Up The Good Work!",
 ]
 
-# Sentiment guard thresholds
+#------Sentiment guard thresholds------
 VADER_POS_THR = 0.20
 VADER_NEG_THR = -0.30
 SUICIDE_GUARD_THR    = 5.0   # %
@@ -213,12 +183,6 @@ def auto_align_label(model, vectorizer):
     return {"depressed_label": dep_label, "pos_avg": pos_avg_dep, "neg_avg": neg_avg_dep, "thr_dep": thr_dep}
 
 def dep_conf_band(p: float) -> str:
-    """
-    Confidence band για την ensemble πιθανότητα κατάθλιψης.
-    - High   : p >= 0.80
-    - Medium : 0.60 <= p < 0.80
-    - Low    : p < 0.60
-    """
     if p >= 0.80:
         return "High"
     if p >= 0.60:
@@ -231,8 +195,10 @@ def band_badge_html(band: str) -> str:
 
 def show_callout(kind: str, title: str, body: str = ""):
     cls = {"error":"card error","warn":"card warn","info":"card info","good":"card good"}.get(kind, "card info")
-    st.markdown(f"<div class='{cls}'><div style='font-weight:700;font-size:1.1rem;margin-bottom:6px;'>{title}</div>{body}</div>",
-                unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='{cls}'><div style='font-weight:700;font-size:1.1rem;margin-bottom:6px;'>{title}</div>{body}</div>",
+        unsafe_allow_html=True
+    )
 
 def vader_label_from_scores(scores):
     c = scores.get('compound', 0.0)
@@ -250,45 +216,33 @@ def sentiment_bucket(bert_label: str, vader_scores) -> str:
     return "Neutral"
 
 def suicide_score_pct(text: str) -> float:
-    """
-    Υπολογίζει έναν απλό suicide-risk score (0–100).
-    Συνδυάζει:
-    - μονολεκτικά keywords (SUICIDE_KEYWORDS)
-    - φράσεις 3 κατηγοριών (strong / medium / weak) με weights.
-    """
     txt = (text or "").lower().strip()
     if not txt:
         return 0.0
-
     toks = txt.split()
     if not toks:
         return 0.0
 
     hits = 0.0
 
-    # 1) Word-level hits (λεξιλόγιο όπως πριν)
     for w in toks:
         if w in SUICIDE_KEYWORDS:
-            hits += 1.0   # weight 1 για κάθε “βαριά” λέξη
+            hits += 1.0
 
-    # 2) Phrase-level hits με διαφορετικά weights
     for ph in SUICIDE_PHRASES.get("strong", []):
         if ph in txt:
-            hits += 3.0   # πολύ ισχυρή ένδειξη
+            hits += 3.0
 
     for ph in SUICIDE_PHRASES.get("medium", []):
         if ph in txt:
-            hits += 2.0   # μέτρια–ισχυρή ένδειξη
+            hits += 2.0
 
     for ph in SUICIDE_PHRASES.get("weak", []):
         if ph in txt:
-            hits += 1.0   # πιο ήπια αλλά σημαντική ένδειξη
+            hits += 1.0
 
-    # 3) Κανονικοποίηση (να μη “πετάγεται” στα μικρά κείμενα)
-    base_len = max(len(toks), 10)   # τουλάχιστον 10 για να μη φουσκώνουν μικρές φράσεις
+    base_len = max(len(toks), 10)
     score = 100.0 * hits / base_len
-
-    # Περιορισμός 0–100
     return max(0.0, min(score, 100.0))
 
 def get_client_ip_best_effort() -> str:
@@ -328,7 +282,6 @@ def send_email_to_admin(subject: str, body: str):
         return False, f"Email error: {e}"
 
 # ---------- Keras safe loader (Keras 3 / TF 2.17) ----------
-# Do imports only if TF is installed
 try:
     import h5py, keras
     from tensorflow.keras.models import load_model, Sequential
@@ -341,7 +294,7 @@ try:
         from tensorflow.keras.preprocessing.text import tokenizer_from_json
     except Exception:
         try:
-            from keras.preprocessing.text import tokenizer_from_json  # fallback
+            from keras.preprocessing.text import tokenizer_from_json
         except Exception:
             tokenizer_from_json = None
 except Exception:
@@ -371,7 +324,6 @@ if load_model is not None:
     }
 
     def _scrub_legacy_layer_cfg(cfg):
-        """Remove legacy keys (trainable/dtype) recursively from model_config."""
         if isinstance(cfg, dict):
             cfg.pop("trainable", None)
             cfg.pop("dtype", None)
@@ -382,7 +334,6 @@ if load_model is not None:
                 _scrub_legacy_layer_cfg(it)
 
     def load_model_compat(model_path: str):
-        """Load .h5/.keras model with compatibility for SpatialDropout1D trainable arg."""
         try:
             return load_model(model_path, compile=False, custom_objects=_CUSTOM_OBJS)
         except TypeError as e:
@@ -399,11 +350,9 @@ if load_model is not None:
                 model = model_from_json(json.dumps(cfg), custom_objects=_CUSTOM_OBJS)
                 model.load_weights(model_path)
                 return model
-            else:
-                raise
+            raise
 
     class KerasTextWrapper:
-        """Wrap Keras model + tokenizer to return p(depressed) from raw text."""
         def __init__(self, model_path, tokenizer_path, max_len=200):
             self.model = load_model_compat(model_path)
             p = pathlib.Path(tokenizer_path)
@@ -422,7 +371,6 @@ if load_model is not None:
             seqs = self.tokenizer.texts_to_sequences(texts)
             X = pad_sequences(seqs, maxlen=self.max_len, padding="post", truncating="post")
             p = self.model.predict(X, verbose=0)
-            # support (N,2) softmax or (N,1) sigmoid
             if hasattr(p, "ndim") and p.ndim == 2 and p.shape[1] == 2:
                 p = p[:, 1]
             return float(p.ravel()[0])
@@ -456,14 +404,14 @@ except Exception:
 # ---------- Load classic ML ----------
 tfidf_vectorizer = joblib.load("tfidf_vectorizer_smote.pkl")
 models = {
-    #"Random Forest": joblib.load("rf_model_smote.pkl"),
+    "Random Forest": joblib.load("rf_model_smote.pkl"),
     "XGBoost": joblib.load("xgb_model_smote.pkl"),
     "Logistic Regression": joblib.load("lr_model_smote.pkl"),
     "SVM": joblib.load("svm_model_smote.pkl"),
     "Naive Bayes": joblib.load("nb_model_smote.pkl"),
 }
 
-# ---------- Load DL (CNN / BiLSTM) silently ----------
+# ---------- Load DL (CNN / BiLSTM) ----------
 text_models = {}
 
 def _try_add_text_model(label, model_candidates, tok_candidates, max_len=200):
@@ -481,17 +429,18 @@ def _try_add_text_model(label, model_candidates, tok_candidates, max_len=200):
             except Exception:
                 continue
 
-# Use the actual filenames you showed in your folder
 _try_add_text_model(
     "CNN",
     model_candidates=[
-        "cnn_model_smote_fixed.h5", "cnn_model_smote.h5", "cnn_model_smote_fixed.keras", "cnn_model_smote.keras"
+        "cnn_model_smote_fixed.h5", "cnn_model_smote.h5",
+        "cnn_model_smote_fixed.keras", "cnn_model_smote.keras"
     ],
     tok_candidates=[
         "cnn_tokenizer.pkl", "tokenizer_smote.pkl", "tokenizer_smote.json"
     ],
     max_len=200
 )
+
 _try_add_text_model(
     "BiLSTM",
     model_candidates=[
@@ -518,7 +467,6 @@ if "label_maps" not in st.session_state:
     if ALIGN_PATH.exists():
         try:
             st.session_state["label_maps"] = json.loads(ALIGN_PATH.read_text())
-            # fill any missing
             for n in models:
                 if n not in st.session_state["label_maps"]:
                     st.session_state["label_maps"][n] = auto_align_label(models[n], tfidf_vectorizer)
@@ -528,12 +476,16 @@ if "label_maps" not in st.session_state:
             ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
         except Exception:
             st.session_state["label_maps"] = build_label_maps()
-            try: ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
-            except Exception: pass
+            try:
+                ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
+            except Exception:
+                pass
     else:
         st.session_state["label_maps"] = build_label_maps()
-        try: ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
-        except Exception: pass
+        try:
+            ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
+        except Exception:
+            pass
 
 # ---------- Header / login ----------
 if "is_admin" not in st.session_state:
@@ -606,7 +558,7 @@ if (not is_admin) and (not show_login):
 
         per_model_probs, per_model_thrs = {}, {}
 
-        # Classic ML
+        # ---------- Classic Machine Learning
         for name, model in models.items():
             raw_p = get_proba(model, X)
             lm = st.session_state["label_maps"][name]
@@ -614,7 +566,7 @@ if (not is_admin) and (not show_login):
             per_model_probs[name] = p_dep
             per_model_thrs[name]  = lm["thr_dep"]
 
-        # DL (CNN / BiLSTM)
+        #---------- Deep Learning (CNN / BiLSTM) ----------
         for name, tm in text_models.items():
             try:
                 raw_p = tm.predict_proba_text([text])
@@ -626,10 +578,10 @@ if (not is_admin) and (not show_login):
             except Exception:
                 continue
 
-        ens_vote   = majority_vote_with_thresholds(per_model_probs, per_model_thrs) if per_model_probs else 0
-        avg_p_dep  = float(np.mean(list(per_model_probs.values()))) if per_model_probs else 0.0
+        ens_vote  = majority_vote_with_thresholds(per_model_probs, per_model_thrs) if per_model_probs else 0
+        avg_p_dep = float(np.mean(list(per_model_probs.values()))) if per_model_probs else 0.0
 
-        # Sentiment context
+        #---------- Sentiment context----------
         try:
             bert = bert_classifier(text)[0] if bert_classifier else {"label": "", "score": 0.0}
         except Exception:
@@ -642,22 +594,45 @@ if (not is_admin) and (not show_login):
         ip_addr = get_client_ip_best_effort()
         pub_ip  = get_public_ip()
 
+        #---------- Guardrails ----------
+        vader_lbl            = vader_label_from_scores(vader_scores)
+        is_vader_neg_strong  = (vader_lbl == 'negative')
+        high_suicide_risk    = (sscore >= SUICIDE_GUARD_THR)
+        high_model_conf      = (avg_p_dep >= MODEL_CONF_GUARD_THR)
+        signals_true         = int(sum([is_vader_neg_strong, high_suicide_risk, high_model_conf]))
+        guard_pass           = (signals_true >= 2) if REQUIRE_TWO_SIGNALS else (signals_true >= 1)
+
+        # ✅ Labels persisted
+        ensemble_label = "DEPRESSED" if ens_vote == 1 else "NOT DEPRESSED"
+        final_label    = "DEPRESSED" if (ens_vote == 1 and guard_pass) else "NOT DEPRESSED"
+
+        # ✅ Persist everything needed for Admin/UI/Email
         st.session_state["last_analysis"] = {
-            "timestamp": datetime.now(TZ).isoformat(sep=" ", timespec="seconds"),
+            "timestamp": datetime.now().isoformat(sep=" ", timespec="seconds"),
             "ip": ip_addr,
             "public_ip": pub_ip,
             "text": text,
+
             "per_model_probs": per_model_probs,
             "per_model_thrs": per_model_thrs,
+
             "ensemble_vote": ens_vote,
             "ensemble_avg_prob": avg_p_dep,
+            "ensemble_label": ensemble_label,
+            "final_label": final_label,
+
+            "guard_pass": bool(guard_pass),
+            "signals_true": int(signals_true),
+            "vader_label": vader_lbl,
+            "senti_bucket": senti_bucket,
+
             "sentiment": vader_scores,
-            "suicide_score": sscore,
+            "suicide_score": float(sscore),
             "bert": {"label": bert_label, "score": float(bert.get("score", 0.0))},
             "label_maps": st.session_state["label_maps"],
         }
 
-        # Mood background
+        #---------- Mood background ----------
         mood = vader_label_from_scores(vader_scores)
         bg_color = random.choice(COLOR_PALETTES[mood])
         st.markdown(f"""
@@ -669,36 +644,32 @@ if (not is_admin) and (not show_login):
         """, unsafe_allow_html=True)
         st.markdown(f'<div class="floating">{random.choice(MOTIVATIONALS)}</div>', unsafe_allow_html=True)
 
-        # Confidence chip
+        # ---------- Confidence chip ----------
         band = dep_conf_band(avg_p_dep)
         st.markdown(f'<div style="margin-top:6px;">Confidence: {band_badge_html(band)}</div>', unsafe_allow_html=True)
 
-        # Guardrails
-        vader_lbl            = vader_label_from_scores(vader_scores)
-        is_vader_neg_strong  = (vader_lbl == 'negative')
-        high_suicide_risk    = (sscore >= SUICIDE_GUARD_THR)
-        high_model_conf      = (avg_p_dep >= MODEL_CONF_GUARD_THR)
-        signals_true         = sum([is_vader_neg_strong, high_suicide_risk, high_model_conf])
-        guard_pass           = (signals_true >= 2) if REQUIRE_TWO_SIGNALS else (signals_true >= 1)
-
-        # Callouts
+        #---------- Callouts----------
         if (ens_vote == 1) and guard_pass:
-            show_callout("error", "😞 The Model Recognised Signs of Depression.",
-                         "If you are Struggling, you can CALL 📞 <b>10306</b> for a free psychological Support (24/7).")
+            show_callout(
+                "error",
+                "😞 The Model Recognised Signs of Depression.",
+                "If you are Struggling, you can CALL 📞 <b>10306</b> for a free psychological Support (24/7)."
+            )
         else:
             if senti_bucket == "Positive":
                 show_callout("good", "😊 Not Depressed.", "No signs of depression detected. Keep positive thinking! 💪")
             elif senti_bucket == "Neutral":
                 show_callout("info", "😐 Neutral.", "A short walk or a warm drink might help reset. 🚶")
             else:
-                show_callout("warn", "🤔 No Signs of Depressed, but a Negative Mood has been Detected.", " Take Care and Do something that makes you HAPPY! 💙")
+                show_callout("warn", "🤔 No Signs of Depressed, but a Negative Mood has been Detected.", "Take care and do something that makes you HAPPY! 💙")
 
         st.caption("⚠️ This tool is not a medical diagnosis. In case of emergency, call 166 or 112 immediately.")
 
-        # Email to admin
+        #---------- Email to admin ----------
         subject = "[AI-Depression] New analysis snapshot"
         mood_txt = vader_lbl.upper()
-        decision_txt = "DEPRESSED" if (ens_vote == 1 and guard_pass) else "NOT DEPRESSED"
+        decision_txt = final_label  # ✅ use final decision
+
         body = (
             f"Timestamp: {st.session_state['last_analysis']['timestamp']}\n"
             f"Local IP: {ip_addr}\n"
@@ -706,10 +677,13 @@ if (not is_admin) and (not show_login):
             f"Summary mood (VADER): {mood_txt} (compound={vader_scores.get('compound',0.0):.3f})\n"
             f"BERT Sentiment: {bert_label} (conf={bert.get('score',0.0)*100:.1f}%)\n"
             f"Ensemble decision: {decision_txt} (avg p_dep={avg_p_dep*100:.1f}%)\n"
+            f"Guardrails pass: {guard_pass} (signals={signals_true})\n"
             f"Suicide risk score: {sscore:.2f}%\n"
             f"\n--- Models ---\n"
-            + "\n".join([f"{name}: p_dep={per_model_probs[name]*100:.1f}% (thr={per_model_thrs[name]*100:.1f}%)"
-                        for name in per_model_probs])
+            + "\n".join([
+                f"{name}: p_dep={per_model_probs[name]*100:.1f}% (thr={per_model_thrs[name]*100:.1f}%)"
+                for name in per_model_probs
+            ])
             + "\n\nUser text: " + text + "\n"
         )
         ok, msg = send_email_to_admin(subject, body)
@@ -719,6 +693,7 @@ if (not is_admin) and (not show_login):
 # ============================ ADMIN VIEW ============================
 elif is_admin:
     import plotly.graph_objects as go
+    import pandas as pd
 
     st.header("Depression Detector - Admin View")
 
@@ -726,49 +701,59 @@ elif is_admin:
         st.error("No analysis performed yet. Go to User View and run an analysis.")
         st.stop()
 
-    data = st.session_state["last_analysis"]
+    data = st.session_state.get("last_analysis", {})
 
     st.subheader("📄 User Text (context)")
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.write(
-        f"**Time:** {data['timestamp']}  |  "
+        f"**Time:** {data.get('timestamp','?')}  |  "
         f"**Local IP:** {data.get('ip','unknown')}  |  "
         f"**Public IP:** {data.get('public_ip','unknown')}"
     )
-    st.write(data["text"])
+    st.write(data.get("text", ""))
     st.markdown("</div>", unsafe_allow_html=True)
+
+    ens_vote = int(data.get("ensemble_vote", 0))
+    avgp     = float(data.get("ensemble_avg_prob", 0.0))
 
     st.subheader("🧩 Ensemble")
     st.write(
         f"- Majority vote (per-model thresholds) → "
-        f"**{'Depressed 😞' if data['ensemble_vote']==1 else 'Not Depressed 😊'}** "
-        f"(avg p_dep={data['ensemble_avg_prob']*100:.1f}%)"
+        f"**{'Depressed 😞' if ens_vote==1 else 'Not Depressed 😊'}** "
+        f"(avg p_dep={avgp*100:.1f}%)"
     )
-    st.write(f"- Confidence band: **{dep_conf_band(data['ensemble_avg_prob'])}**")
+    st.write(f"- Confidence band: **{dep_conf_band(avgp)}**")
+    st.write(f"- Guardrails pass: **{data.get('guard_pass', False)}** (signals={data.get('signals_true', 0)})")
+    st.write(f"- Final decision (UI): **{data.get('final_label','?')}**")
 
     st.subheader("🧠 BERT Sentiment")
-    st.write(f"- Label: **{data['bert']['label']}**  |  Confidence: **{data['bert']['score']*100:.2f}%**")
+    bert = data.get("bert", {})
+    st.write(f"- Label: **{bert.get('label','')}**  |  Confidence: **{float(bert.get('score',0.0))*100:.2f}%**")
 
     st.subheader("🤖 ML Models — probability, threshold & decision")
-    for name, p in data["per_model_probs"].items():
-        lm  = data["label_maps"][name]
-        thr = data["per_model_thrs"][name]
+    per_probs = data.get("per_model_probs", {})
+    per_thrs  = data.get("per_model_thrs", {})
+    label_maps = data.get("label_maps", {})
+
+    for name, p in per_probs.items():
+        lm  = label_maps.get(name, {})
+        thr = float(per_thrs.get(name, 0.5))
+        p = float(p)
         decision = "Depressed 😞" if p >= thr else "Not Depressed 😊"
         st.write(
             f"- **{name}** → p_dep={p*100:.1f}% (thr={thr*100:.1f}%) → **{decision}** "
-            f"(auto-align: depressed_label={lm['depressed_label']}, "
-            f"probes pos_avg={lm['pos_avg']:.2f}, neg_avg={lm['neg_avg']:.2f})"
+            f"(auto-align: depressed_label={lm.get('depressed_label','?')}, "
+            f"probes pos_avg={lm.get('pos_avg',0):.2f}, neg_avg={lm.get('neg_avg',0):.2f})"
         )
 
-    # DL subset table (if present)
-    import pandas as pd
-    dl_names = [n for n in ["CNN","BiLSTM"] if n in data["per_model_probs"]]
+    #---------- Deep Learning subset table ----------
+    dl_names = [n for n in ["CNN","BiLSTM"] if n in per_probs]
     if dl_names:
         st.subheader("🧪 DL Models — probability, threshold & decision")
         rows = []
         for name in dl_names:
-            p   = float(data["per_model_probs"][name])
-            thr = float(data["per_model_thrs"][name])
+            p   = float(per_probs.get(name, 0.0))
+            thr = float(per_thrs.get(name, 0.5))
             rows.append({
                 "Model": name,
                 "p_dep": round(p, 4),
@@ -780,10 +765,10 @@ elif is_admin:
         st.info("Δεν υπάρχουν προβλέψεις από DL μοντέλα στο τελευταίο run.")
 
     st.subheader("📊 VADER Sentiment")
-    scores = data["sentiment"]
-    neg = scores.get('neg', 0.0)
-    neu = scores.get('neu', 0.0)
-    pos = scores.get('pos', 0.0)
+    scores = data.get("sentiment", {})
+    neg = float(scores.get('neg', 0.0))
+    neu = float(scores.get('neu', 0.0))
+    pos = float(scores.get('pos', 0.0))
     fig, axs = plt.subplots(1, 2, figsize=(12, 5))
     axs[0].bar(['Negative', 'Neutral', 'Positive'], [neg, neu, pos],
                color=['#1f77b4', '#ff7f0e', '#2ca02c'])
@@ -798,7 +783,7 @@ elif is_admin:
     st.subheader("🔎 Top tokens (TF-IDF) for this text")
     try:
         feature_names = np.array(tfidf_vectorizer.get_feature_names_out())
-        X_vec = tfidf_vectorizer.transform([data['text']])
+        X_vec = tfidf_vectorizer.transform([data.get('text','')])
         row = X_vec.toarray()[0]
         if np.count_nonzero(row) == 0:
             st.info("No informative tokens found (all zeros).")
@@ -812,19 +797,15 @@ elif is_admin:
 
     # ---------------- Suicide-Risk ----------------
     st.subheader("🧠 Suicide-Risk")
-    s = float(data["suicide_score"])
+    s = float(data.get("suicide_score", 0.0))
+
     def risk_style(score: float):
-        """
-        Κατηγορίες Suicide-Risk:
-        - LOW      : score < 10%
-        - MODERATE : 10% <= score < 30%
-        - HIGH     : score >= 30%
-        """
         if score >= 30:
             return ("HIGH", "#6b1f1f", "#ff4d4d")
         if score >= 10:
             return ("MODERATE", "#5a3a10", "#ffa726")
         return ("LOW", "#1f4021", "#66bb6a")
+
     level, pill_bg, dot_color = risk_style(s)
     pill_html = f"""
     <div style="background:{pill_bg};border:1px solid rgba(255,255,255,0.12);border-radius:16px;
@@ -838,30 +819,24 @@ elif is_admin:
     </div>"""
     st.markdown(pill_html, unsafe_allow_html=True)
 
-    analyzed_text = data["text"].lower()
+    analyzed_text = (data.get("text", "") or "").lower()
     wc = Counter(analyzed_text.split())
 
-    # 1) Λέξεις υψηλού ρίσκου (όπως πριν)
     risky_words = [w for w in wc if w in SUICIDE_KEYWORDS]
-
-    # 2) Αν δεν βρούμε risky words, fallback στα πιο συχνά tokens
     if risky_words:
         words_for_plot = risky_words
         info_msg = "3D visualization of high-risk suicide words (if any)."
     else:
-        # top-5 πιο συχνές λέξεις ως fallback
         words_for_plot = [w for w, _ in wc.most_common(5)]
         info_msg = "No explicit suicide words detected — showing top frequent tokens instead."
 
     if words_for_plot:
         x_vals = list(range(len(words_for_plot)))
         y_vals = [wc[w] for w in words_for_plot]
-        z_vals = [neg for _ in words_for_plot]  # χρησιμοποιούμε το VADER negative score ως z
+        z_vals = [neg for _ in words_for_plot]
 
         fig3d = go.Figure(data=[go.Scatter3d(
-            x=x_vals,
-            y=y_vals,
-            z=z_vals,
+            x=x_vals, y=y_vals, z=z_vals,
             mode='markers+text',
             text=words_for_plot,
             textposition='top center',
@@ -884,8 +859,3 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
-
-
-
-
-
