@@ -559,8 +559,11 @@ is_admin   = st.session_state.get("is_admin", False)
 
 # ============================ USER VIEW ============================
 if (not is_admin) and (not show_login):
-    user_input = st.text_area("✍️ Write your text here:", height=160, placeholder="Type something here...")
-
+    user_input = st.text_area(
+    "✍️ Write here about your day - feelings:",
+    height=180,
+    placeholder="Example: Lately I feel stressed and tired. I can’t focus, my sleep is bad, and I don’t enjoy things like before..."
+)
     if st.button("📊 Analyze"):
         text = (user_input or "").strip()
         if len(text) < 5:
@@ -890,6 +893,7 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
+
 
 
 
