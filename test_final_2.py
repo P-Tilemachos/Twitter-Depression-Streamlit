@@ -507,13 +507,10 @@ if "show_login" not in st.session_state:
 top_left, _, top_right = st.columns([6, 6, 2])
 with top_left:
     is_admin = st.session_state.get("is_admin", False)
+    show_login = st.session_state["show_login"]
     st.markdown(f"Now you are in: **{'Admin View' if is_admin else 'User View'}**")
     if not is_admin:
         st.title("🧠Depression Detector & Mood Reactive UI")
-        show_callout(
-            "info",
-            "✍️Write a few sentences about your day or how you’ve been feeling lately (e.g., mood, stress, sleep, motivation). "
-        )
         
 with top_right:
     if st.session_state["is_admin"]:
@@ -893,6 +890,7 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
+
 
 
 
