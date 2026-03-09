@@ -620,7 +620,7 @@ if (not is_admin) and (not show_login):
 
               #---------- Guardrails ----------
         is_vader_neg_strong = (vader_lbl == "negative")
-        is_bert_neg_strong  = (bert_label.upper() == "NEGATIVE" and bert_score >= 0.90)
+        is_bert_neg_strong = (bert_classifier is not None and bert_label.upper() == "NEGATIVE" and bert_score >= 0.90)
         high_suicide_risk   = (sscore >= SUICIDE_GUARD_THR)
         high_model_conf     = (avg_p_dep >= MODEL_CONF_GUARD_THR)
 
@@ -890,5 +890,6 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
+
 
 
