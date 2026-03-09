@@ -407,7 +407,7 @@ def load_bert_pipeline():
         )
     except Exception as e:
         # Προαιρετικά: δείξε 1 φορά το error στο UI για να ξέρεις τι φταίει στο Cloud
-        # Silent fallback – BERT unavailable in this environment        
+        st.warning(f"BERT sentiment disabled (could not load model): {e}")
         return None
 
 bert_classifier = load_bert_pipeline()
@@ -415,7 +415,7 @@ bert_classifier = load_bert_pipeline()
 # ---------- Load classic ML ----------
 tfidf_vectorizer = joblib.load("tfidf_vectorizer_smote.pkl")
 models = {
-    #"Random Forest": joblib.load("rf_model_smote.pkl"),
+    "Random Forest": joblib.load("rf_model_smote.pkl"),
     "XGBoost": joblib.load("xgb_model_smote.pkl"),
     "Logistic Regression": joblib.load("lr_model_smote.pkl"),
     "SVM": joblib.load("svm_model_smote.pkl"),
@@ -509,9 +509,9 @@ with top_left:
     is_admin = st.session_state.get("is_admin", False)
     show_login = st.session_state["show_login"]
     st.markdown(f"Now you are in: **{'Admin View' if is_admin else 'User View'}**")
-    if not is_admin:
+    if not is_admin and not st.session_state["show_login"]:
         st.title("🧠Depression Detector & Mood Reactive UI")
-        
+
 with top_right:
     if st.session_state["is_admin"]:
         if st.button("🔒 Log out", use_container_width=True):
@@ -622,11 +622,12 @@ if (not is_admin) and (not show_login):
 
               #---------- Guardrails ----------
         is_vader_neg_strong = (vader_lbl == "negative")
+        is_bert_neg_strong  = (bert_label.upper() == "NEGATIVE" and bert_score >= 0.90)
         high_suicide_risk   = (sscore >= SUICIDE_GUARD_THR)
         high_model_conf     = (avg_p_dep >= MODEL_CONF_GUARD_THR)
 
-        signals_true = int(sum([is_vader_neg_strong, high_suicide_risk, high_model_conf]))
-        guard_pass   = (signals_true >= 2) if REQUIRE_TWO_SIGNALS else (signals_true >= 1)
+        signals_true = int(sum([is_vader_neg_strong, is_bert_neg_strong, high_suicide_risk, high_model_conf]))
+        guard_pass   = (signals_true >= 2) if REQUIRE_TWO_SIGNALS else (signals_true >=1)
 
         # ✅ Labels persisted
         ensemble_label = "DEPRESSED" if ens_vote == 1 else "NOT DEPRESSED"
@@ -706,6 +707,7 @@ if (not is_admin) and (not show_login):
             f"Summary mood (VADER): {mood_txt} (compound={vader_scores.get('compound',0.0):.3f})\n"
             f"BERT Sentiment: {bert_label} (conf={bert_score*100:.1f}%)\n"
             f"Ensemble decision: {decision_txt} (avg p_dep={avg_p_dep*100:.1f}%)\n"
+            f"Final decision (after guardrails): {final_label}\n"
             f"Guardrails pass: {guard_pass} (signals={signals_true})\n"
             f"Suicide risk score: {sscore:.2f}%\n"
             f"\n--- Models ---\n"
@@ -793,7 +795,7 @@ elif is_admin:
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
-        st.info("Δεν υπάρχουν προβλέψεις από DL μοντέλα στο τελευταίο run.")
+        st.info("Deep Learning module: not enabled in this deployment environment. The app runs in ML-only inference mode for maximum compatibility.")
 
     st.subheader("📊 VADER Sentiment")
     scores = data.get("sentiment", {})
@@ -890,8 +892,3 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
-
-
-
-
-
