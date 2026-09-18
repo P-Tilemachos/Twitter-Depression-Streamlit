@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-test_final_2.py  (FIXED)
+test_final_2.py  (FIXED + DL LOADER v2)
 AI Depression Detector (Final Thesis Version — DL-ready)
 - TF-IDF + ML models (RF, XGB, LR, SVM, NB)
-- Deep Learning text models (CNN, BiLSTM) with safe loader (.h5/.keras)
-- Tokenizers (.pkl/.json)
+- Deep Learning text models (CNN, BiLSTM) with a robust loader (.h5 / .keras)
+- Tokenizers (.pkl / .json) -> loaded WITHOUT depending on the Keras Tokenizer class
 - Per-model auto label alignment (probes) & thresholds
 - Ensemble decision + guardrails
 - VADER + BERT sentiment (messaging)
@@ -14,17 +14,35 @@ AI Depression Detector (Final Thesis Version — DL-ready)
 1) All ensemble/guard outputs are persisted safely inside st.session_state["last_analysis"]
 2) Admin View reads ONLY from st.session_state["last_analysis"] using .get() to avoid NameError
 3) Added explicit keys: ensemble_label, final_label, guard_pass, signals_true, vader_label, senti_bucket
+
+✅ DL LOADER v2:
+A) Auto-discovery of model files (*.h5 / *.keras) and tokenizers (*.pkl / *.json)
+   in the script folder, the working folder and their ./models sub-folders
+B) Several load strategies (custom_objects -> plain -> config scrub + weights) for both .h5 and .keras
+C) Tokenizer loader that works even if the Keras Tokenizer class is not importable (Keras 2 -> Keras 3 pickles)
+D) max_len is read from the model input shape (fallback: 200); own pad_sequences (no extra import)
+E) Models are cached with st.cache_resource (no reload on every Streamlit rerun)
+F) Every success / failure is logged and shown in Admin View (no more silent `except: continue`)
+G) Label-alignment of DL models is recomputed automatically if the model files change
 """
 
 #--------------------------------------Imports--------------------------------------
 import os
+
+# Must be set BEFORE tensorflow / keras are imported
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+
 import json
 import math
 import random
 import pathlib
+import pickle
 import platform
 import smtplib
 import socket
+import re
+import zipfile
 from email.mime.text import MIMEText
 from collections import Counter
 from datetime import datetime
@@ -281,31 +299,165 @@ def send_email_to_admin(subject: str, body: str):
     except Exception as e:
         return False, f"Email error: {e}"
 
-# ---------- Keras safe loader (Keras 3 / TF 2.17) ----------
+# =====================================================================
+# ===== DL-CORE-BEGIN  (Deep Learning loader: tokenizer + Keras) ======
+# =====================================================================
+
+# ---------- Where to look for model / tokenizer files ----------
 try:
-    import h5py, keras
-    from tensorflow.keras.models import load_model, Sequential
+    BASE_DIR = pathlib.Path(__file__).resolve().parent
+except NameError:
+    BASE_DIR = pathlib.Path.cwd()
+
+SEARCH_DIRS = []
+for _d in (BASE_DIR, pathlib.Path.cwd(), BASE_DIR / "models", pathlib.Path.cwd() / "models"):
+    if _d not in SEARCH_DIRS:
+        SEARCH_DIRS.append(_d)
+
+# ---------- Tokenizer (independent from the Keras Tokenizer class) ----------
+_DEFAULT_TOK_FILTERS = '!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n'
+
+
+class SimpleTokenizer:
+    """Drop-in replacement of keras Tokenizer.texts_to_sequences() (same behaviour)."""
+
+    def __init__(self, word_index, num_words=None, oov_token=None,
+                 filters=_DEFAULT_TOK_FILTERS, lower=True, split=" ", char_level=False):
+        self.word_index = {str(k): int(v) for k, v in dict(word_index).items()}
+        self.num_words = int(num_words) if num_words else None
+        self.oov_token = oov_token
+        self.filters = filters if filters is not None else ""
+        self.lower = bool(lower)
+        self.split = split if split else " "
+        self.char_level = bool(char_level)
+        self._oov_index = self.word_index.get(oov_token) if oov_token is not None else None
+        self._trans = str.maketrans({c: self.split for c in self.filters})
+
+    def _tokenize(self, text: str):
+        if self.lower:
+            text = text.lower()
+        if self.char_level:
+            return list(text)
+        text = text.translate(self._trans)
+        return [t for t in text.split(self.split) if t]
+
+    def texts_to_sequences(self, texts):
+        out = []
+        for t in texts:
+            vect = []
+            for w in self._tokenize(str(t)):
+                i = self.word_index.get(w)
+                if i is not None:
+                    if self.num_words and i >= self.num_words:
+                        if self._oov_index is not None:
+                            vect.append(self._oov_index)
+                    else:
+                        vect.append(i)
+                elif self._oov_index is not None:
+                    vect.append(self._oov_index)
+            out.append(vect)
+        return out
+
+
+class _KerasTokStub:
+    """Empty placeholder: receives the state of a pickled keras Tokenizer."""
+    pass
+
+
+class _TokUnpickler(pickle.Unpickler):
+    """Unpickles a keras Tokenizer even if the keras module path does not exist any more."""
+    def find_class(self, module, name):
+        if name == "Tokenizer" and "keras" in module:
+            return _KerasTokStub
+        return super().find_class(module, name)
+
+
+def _tokenizer_from_state(state) -> SimpleTokenizer:
+    def g(key, default=None):
+        if isinstance(state, dict):
+            return state.get(key, default)
+        return getattr(state, key, default)
+
+    word_index = g("word_index")
+    if isinstance(word_index, str):
+        word_index = json.loads(word_index)
+    if not word_index:
+        raise ValueError("Tokenizer file has no 'word_index' (is it really a Keras Tokenizer?).")
+    return SimpleTokenizer(
+        word_index=word_index,
+        num_words=g("num_words"),
+        oov_token=g("oov_token"),
+        filters=g("filters", _DEFAULT_TOK_FILTERS),
+        lower=g("lower", True),
+        split=g("split", " "),
+        char_level=g("char_level", False),
+    )
+
+
+def load_tokenizer_compat(path) -> SimpleTokenizer:
+    p = pathlib.Path(path)
+    ext = p.suffix.lower()
+
+    if ext == ".json":
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, str):            # tokenizer.to_json() saved with json.dump(...)
+            data = json.loads(data)
+        if not isinstance(data, dict):
+            raise ValueError("Unsupported tokenizer JSON structure.")
+        cfg = data.get("config", data)
+        return _tokenizer_from_state(cfg)
+
+    if ext in (".pkl", ".pickle", ".joblib"):
+        try:
+            with open(p, "rb") as f:
+                obj = _TokUnpickler(f).load()
+        except Exception as e1:
+            try:
+                obj = joblib.load(p)
+            except Exception as e2:
+                raise RuntimeError(f"pickle: {type(e1).__name__}: {e1} | joblib: {type(e2).__name__}: {e2}")
+        return _tokenizer_from_state(obj)
+
+    raise ValueError("Unsupported tokenizer format (use .pkl or .json)")
+
+
+def pad_post(seqs, maxlen: int):
+    """Same as keras pad_sequences(..., padding='post', truncating='post')."""
+    X = np.zeros((len(seqs), maxlen), dtype="int32")
+    for i, s in enumerate(seqs):
+        s = s[:maxlen]
+        if s:
+            X[i, :len(s)] = s
+    return X
+
+
+# ---------- Keras imports (Keras 3 / TF 2.16+ ; also works with older) ----------
+KERAS_IMPORT_ERROR = None
+keras = None
+load_model = None
+model_from_json = None
+Sequential = None
+h5py = None
+try:
+    import h5py
+    import keras
+    from tensorflow.keras.models import load_model, Sequential, model_from_json
     from tensorflow.keras.layers import (
         Embedding, SpatialDropout1D, LSTM, GRU, Conv1D, MaxPooling1D,
         GlobalMaxPooling1D, Dense, Dropout, Bidirectional, Flatten, Input
     )
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
-    try:
-        from tensorflow.keras.preprocessing.text import tokenizer_from_json
-    except Exception:
-        try:
-            from keras.preprocessing.text import tokenizer_from_json
-        except Exception:
-            tokenizer_from_json = None
-except Exception:
+except Exception as _e:
+    KERAS_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
     load_model = None
-    pad_sequences = None
-    tokenizer_from_json = None
 
 if load_model is not None:
-    @keras.saving.register_keras_serializable(package="Sequential")
-    class MySequential(Sequential):
-        pass
+    try:
+        @keras.saving.register_keras_serializable(package="Sequential")
+        class MySequential(Sequential):
+            pass
+    except Exception:
+        MySequential = Sequential
 
     _CUSTOM_OBJS = {
         "Sequential": MySequential,
@@ -323,67 +475,383 @@ if load_model is not None:
         "Input": Input,
     }
 
+    # every built-in layer class by name (legacy configs have no "module" key, so Keras 3 cannot find them itself)
+    # (+ initializers / regularizers / constraints: e.g. Keras 3.2 cannot resolve the legacy "Orthogonal" name of LSTM)
+    _ALL_LAYER_OBJS = {}
+    for _mod_name in ("initializers", "regularizers", "constraints", "layers"):   # layers last -> they win on name clashes
+        try:
+            _mod = getattr(keras, _mod_name)
+            for _nm in dir(_mod):
+                _obj = getattr(_mod, _nm, None)
+                if _nm[:1].isupper() and isinstance(_obj, type):
+                    _ALL_LAYER_OBJS[_nm] = _obj
+        except Exception:
+            pass
+    _ALL_LAYER_OBJS.update({k: v for k, v in _CUSTOM_OBJS.items() if k != "Sequential"})
+
+    # keys that old (Keras 2) configs contain and Keras 3 layers reject
+    _LEGACY_DROP_KEYS = ("trainable", "dtype", "time_major")
+
     def _scrub_legacy_layer_cfg(cfg):
         if isinstance(cfg, dict):
-            cfg.pop("trainable", None)
-            cfg.pop("dtype", None)
+            for k in _LEGACY_DROP_KEYS:
+                cfg.pop(k, None)
             for k in list(cfg.keys()):
                 _scrub_legacy_layer_cfg(cfg[k])
         elif isinstance(cfg, list):
             for it in cfg:
                 _scrub_legacy_layer_cfg(it)
 
-    def load_model_compat(model_path: str):
+    def _pop_key_deep(obj, key) -> bool:
+        """Removes `key` from every nested dict. Returns True if something was removed."""
+        removed = False
+        if isinstance(obj, dict):
+            if key in obj:
+                obj.pop(key)
+                removed = True
+            for v in list(obj.values()):
+                removed = _pop_key_deep(v, key) or removed
+        elif isinstance(obj, list):
+            for v in obj:
+                removed = _pop_key_deep(v, key) or removed
+        return removed
+
+    _BAD_KW_RE = re.compile(r"unexpected keyword argument '(\w+)'")
+    _BAD_KW_SET_RE = re.compile(r"Unrecognized keyword arguments(?: passed to \w+)?: \{([^}]*)\}")
+
+    def _bad_kwargs_from_error(msg: str):
+        keys = set(_BAD_KW_RE.findall(msg))
+        for chunk in _BAD_KW_SET_RE.findall(msg):
+            keys.update(re.findall(r"'(\w+)'\s*:", chunk))
+        return keys
+
+    def _read_model_config(model_path: str):
+        """Reads the architecture JSON from a legacy .h5 file or from a .keras archive."""
+        p = pathlib.Path(model_path)
+        if p.suffix.lower() == ".keras":
+            with zipfile.ZipFile(p) as z:
+                return json.loads(z.read("config.json").decode("utf-8"))
+        with h5py.File(p, "r") as f:
+            raw = f.attrs.get("model_config", None)
+            if raw is None:
+                raise RuntimeError("No model_config attribute inside model file "
+                                   "(weights-only file? the full model must be saved).")
+            cfg_str = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            return json.loads(cfg_str)
+
+    def _saved_keras_version(model_path: str) -> str:
         try:
-            return load_model(model_path, compile=False, custom_objects=_CUSTOM_OBJS)
-        except TypeError as e:
-            msg = str(e)
-            if ("SpatialDropout1D" in msg) and ("unexpected keyword argument 'trainable'" in msg):
-                with h5py.File(model_path, "r") as f:
-                    raw = f.attrs.get("model_config", None)
-                    if raw is None:
-                        raise RuntimeError("No model_config attribute inside model file.")
-                    cfg_str = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-                    cfg = json.loads(cfg_str)
-                _scrub_legacy_layer_cfg(cfg)
-                from keras.models import model_from_json
-                model = model_from_json(json.dumps(cfg), custom_objects=_CUSTOM_OBJS)
-                model.load_weights(model_path)
-                return model
-            raise
+            p = pathlib.Path(model_path)
+            if p.suffix.lower() == ".keras":
+                with zipfile.ZipFile(p) as z:
+                    return str(json.loads(z.read("metadata.json")).get("keras_version", ""))
+            with h5py.File(p, "r") as f:
+                v = f.attrs.get("keras_version", "")
+                return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+        except Exception:
+            return ""
+
+    def _ver_tuple(v: str):
+        nums = re.findall(r"\d+", v or "")
+        return tuple(int(x) for x in nums[:2])
+
+    def _dl_hint(errors_text: str, saved_ver: str, installed_ver: str) -> str:
+        hints = []
+        sv, iv = _ver_tuple(saved_ver), _ver_tuple(installed_ver)
+        if sv and iv and sv > iv:
+            hints.append(f"HINT: the file was saved with a NEWER Keras ({saved_ver}) than the installed one "
+                         f"({installed_ver}) -> upgrade Keras or re-save the model as legacy .h5.")
+        if "objects could not be loaded" in errors_text and iv and iv < (3, 3):
+            hints.append("HINT: known Keras 3.2.x bug when loading LSTM/GRU/Bidirectional from .keras -> run: "
+                         "pip install -U \"keras>=3.4\" (tested with keras 3.6.0 + TensorFlow 2.17), "
+                         "or use the .h5 version of the model.")
+        return " ".join(hints)
+
+    def _deserialize_layer(layer_cfg):
+        """Builds ONE layer from an old/new config; drops any kwarg the installed Keras rejects."""
+        cfg = json.loads(json.dumps(layer_cfg))          # deep copy
+        _scrub_legacy_layer_cfg(cfg)
+        _pop_key_deep(cfg, "batch_input_shape")
+        last_err = None
+        for _ in range(12):
+            try:
+                return keras.layers.deserialize(cfg, custom_objects=_ALL_LAYER_OBJS)
+            except Exception as e:
+                last_err = e
+                bad = _bad_kwargs_from_error(str(e))
+                if not bad:
+                    break
+                if not any([_pop_key_deep(cfg, k) for k in bad]):
+                    break
+        raise last_err
+
+    def _rebuild_sequential(model_path: str):
+        """Layer-by-layer rebuild of a Sequential model (works for legacy Keras-2 .h5 files
+        that Keras 3 cannot deserialize directly), then loads the weights."""
+        cfg = _read_model_config(model_path)
+        if cfg.get("class_name") != "Sequential":
+            raise RuntimeError(f"layer-by-layer rebuild supports Sequential models only (found {cfg.get('class_name')}).")
+        inner = cfg.get("config", {})
+        layers_cfg = inner.get("layers", []) if isinstance(inner, dict) else inner
+        name = inner.get("name") if isinstance(inner, dict) else None
+
+        input_shape, input_dtype, layers = None, "float32", []
+        if isinstance(inner, dict) and inner.get("build_input_shape"):
+            input_shape = tuple(inner["build_input_shape"][1:])
+        for lc in layers_cfg:
+            conf = lc.get("config", {}) or {}
+            bshape = conf.get("batch_input_shape") or conf.get("batch_shape")
+            if lc.get("class_name") == "InputLayer":
+                if bshape:
+                    input_shape = tuple(bshape[1:])
+                if isinstance(conf.get("dtype"), str):
+                    input_dtype = conf["dtype"]
+                continue
+            if input_shape is None and bshape:
+                input_shape = tuple(bshape[1:])
+            layers.append(_deserialize_layer(lc))
+        if input_shape is None or not layers:
+            raise RuntimeError("Could not infer the input shape / layers from the model config.")
+
+        model = Sequential(name=name)
+        model.add(keras.Input(shape=input_shape, dtype=input_dtype))
+        for layer in layers:
+            model.add(layer)
+        model.load_weights(model_path)
+        return model
+
+    def load_model_compat(model_path: str):
+        """Tries several strategies. Raises RuntimeError with ALL error messages if every one fails."""
+        errors = []
+
+        # 1) standard loader (with / without custom objects)
+        for label, kwargs in (("custom_objects", {"custom_objects": _CUSTOM_OBJS}), ("plain", {})):
+            try:
+                return load_model(model_path, compile=False, **kwargs)
+            except Exception as e:
+                errors.append(f"load_model[{label}] -> {type(e).__name__}: {str(e)[:250]}")
+
+        # 2) layer-by-layer rebuild (+ weights)  <- fixes legacy .h5 (SpatialDropout1D 'trainable' etc.)
+        try:
+            return _rebuild_sequential(model_path)
+        except Exception as e:
+            errors.append(f"rebuild-layers+weights -> {type(e).__name__}: {str(e)[:250]}")
+
+        # 3) generic config scrub via model_from_json (non-Sequential models)
+        try:
+            cfg = _read_model_config(model_path)
+            _scrub_legacy_layer_cfg(cfg)
+            model = model_from_json(json.dumps(cfg), custom_objects=_CUSTOM_OBJS)
+            model.load_weights(model_path)
+            return model
+        except Exception as e:
+            errors.append(f"config-scrub+weights -> {type(e).__name__}: {str(e)[:250]}")
+
+        sv = _saved_keras_version(model_path)
+        try:
+            iv = keras.__version__
+        except Exception:
+            iv = ""
+        joined = " || ".join(errors)
+        info = f" [file saved with keras {sv or '?'}; installed keras {iv or '?'}]"
+        hint = _dl_hint(joined, sv, iv)
+        raise RuntimeError(joined + info + ((" " + hint) if hint else ""))
+
+    def _embedding_vocab_limit(model):
+        try:
+            for layer in model.layers:
+                if layer.__class__.__name__ == "Embedding":
+                    return int(layer.input_dim)
+        except Exception:
+            pass
+        return None
+
+    def _model_max_len(model, default: int) -> int:
+        try:
+            shp = model.input_shape
+            if isinstance(shp, list):
+                shp = shp[0]
+            if isinstance(shp, (tuple, list)) and len(shp) >= 2 and isinstance(shp[1], int) and shp[1] > 0:
+                return int(shp[1])
+        except Exception:
+            pass
+        return int(default)
+
+    def _file_sig(path) -> str:
+        try:
+            p = pathlib.Path(path)
+            stt = p.stat()
+            return f"{p.name}:{stt.st_size}:{int(stt.st_mtime)}"
+        except Exception:
+            return str(path)
 
     class KerasTextWrapper:
-        def __init__(self, model_path, tokenizer_path, max_len=200):
-            self.model = load_model_compat(model_path)
-            p = pathlib.Path(tokenizer_path)
-            if p.suffix.lower() == ".pkl":
-                self.tokenizer = joblib.load(p)
-            elif p.suffix.lower() == ".json":
-                if tokenizer_from_json is None:
-                    raise RuntimeError("tokenizer_from_json not available. Provide .pkl tokenizer instead.")
-                with open(p, "r", encoding="utf-8") as f:
-                    self.tokenizer = tokenizer_from_json(json.load(f))
-            else:
-                raise ValueError("Unsupported tokenizer format (use .pkl or .json)")
-            self.max_len = max_len
+        """Keras text model (CNN / LSTM / ...) + tokenizer  ->  probability."""
+
+        def __init__(self, model, tokenizer, max_len=200, model_path="", tokenizer_path=""):
+            self.model = model
+            self.tokenizer = tokenizer
+            self.max_len = _model_max_len(model, max_len)
+            self.vocab_limit = _embedding_vocab_limit(model)
+            self.model_path = str(model_path)
+            self.tokenizer_path = str(tokenizer_path)
+            self.sig = _file_sig(model_path) + "|" + _file_sig(tokenizer_path)
+            self._validate()
+
+        def _validate(self):
+            p = self.predict_proba_batch(["i feel fine today", "i feel so sad and alone"])
+            if not np.all(np.isfinite(p)):
+                raise RuntimeError("Model returned non-finite values in the test prediction.")
+
+        def predict_proba_batch(self, texts):
+            seqs = self.tokenizer.texts_to_sequences(list(texts))
+            X = pad_post(seqs, self.max_len)
+            if self.vocab_limit:
+                X = np.where(X < self.vocab_limit, X, 0).astype("int32")   # ids outside the embedding -> padding
+            p = self.model.predict(X, verbose=0)
+            if isinstance(p, (list, tuple)):
+                p = p[0]
+            p = np.asarray(p, dtype="float64")
+            if p.ndim == 2 and p.shape[1] == 2:
+                p = p[:, 1]
+            elif p.ndim == 2 and p.shape[1] > 2:
+                raise RuntimeError(f"Unsupported output shape {p.shape} (binary model expected).")
+            p = p.reshape(len(X))
+            if p.min() < 0.0 or p.max() > 1.0:          # logits -> probabilities
+                p = 1.0 / (1.0 + np.exp(-p))
+            return p
 
         def predict_proba_text(self, texts):
-            seqs = self.tokenizer.texts_to_sequences(texts)
-            X = pad_sequences(seqs, maxlen=self.max_len, padding="post", truncating="post")
-            p = self.model.predict(X, verbose=0)
-            if hasattr(p, "ndim") and p.ndim == 2 and p.shape[1] == 2:
-                p = p[:, 1]
-            return float(p.ravel()[0])
+            return float(self.predict_proba_batch(texts)[0])
 else:
     KerasTextWrapper = None
 
+
 def auto_align_label_textmodel(text_model: "KerasTextWrapper"):
-    pos_ps = [text_model.predict_proba_text([s]) for s in PROBE_POS]
-    neg_ps = [text_model.predict_proba_text([s]) for s in PROBE_NEG]
+    pos_ps = text_model.predict_proba_batch(PROBE_POS)      # one batch call instead of 13 single calls
+    neg_ps = text_model.predict_proba_batch(PROBE_NEG)
     dep_label, pos_avg_dep, neg_avg_dep, thr_dep = align_stats_from_raw_means(
         float(np.mean(pos_ps)), float(np.mean(neg_ps))
     )
-    return {"depressed_label": dep_label, "pos_avg": pos_avg_dep, "neg_avg": neg_avg_dep, "thr_dep": thr_dep}
+    return {
+        "depressed_label": dep_label, "pos_avg": pos_avg_dep, "neg_avg": neg_avg_dep,
+        "thr_dep": thr_dep, "sig": text_model.sig,
+    }
+
+
+# ---------- Discovery + cached loading ----------
+DL_SPECS = {
+    "CNN": {
+        "models": ["cnn_model_smote_fixed.h5", "cnn_model_smote.h5",
+                   "cnn_model_smote_fixed.keras", "cnn_model_smote.keras"],
+        "tokenizers": ["cnn_tokenizer.pkl", "tokenizer_smote.pkl", "tokenizer_smote.json"],
+        "keywords": ("cnn", "conv"),
+        "exclude": ("lstm", "gru"),
+    },
+    "BiLSTM": {
+        "models": ["lstm_model_smote_fixed.h5", "lstm_model_smote.h5",
+                   "lstm_model_smote_fixed.keras", "lstm_model_smote.keras"],
+        "tokenizers": ["bilstm_tokenizer.pkl", "tokenizer_smote.pkl", "tokenizer_smote.json"],
+        "keywords": ("lstm", "gru"),
+        "exclude": ("cnn", "conv"),
+    },
+}
+
+
+def _collect_files(explicit_names, keywords, exts, exclude=()):
+    """Explicit names first (in the given order), then auto-discovered files by keyword."""
+    found, seen = [], set()
+
+    def _add(p):
+        try:
+            key = str(p.resolve())
+        except Exception:
+            key = str(p)
+        if key not in seen:
+            seen.add(key)
+            found.append(p)
+
+    for name in explicit_names:
+        for d in SEARCH_DIRS:
+            p = d / name
+            if p.is_file():
+                _add(p)
+    for d in SEARCH_DIRS:
+        if not d.is_dir():
+            continue
+        for p in sorted(d.iterdir()):
+            stem = p.stem.lower()
+            if (p.is_file() and p.suffix.lower() in exts
+                    and any(k in stem for k in keywords)
+                    and not any(x in stem for x in exclude)):
+                _add(p)
+    return found
+
+
+def dl_env_info() -> dict:
+    info = {"python": platform.python_version()}
+    for mod in ("tensorflow", "keras", "h5py"):
+        try:
+            info[mod] = __import__(mod).__version__
+        except Exception:
+            info[mod] = "not installed"
+    return info
+
+
+@st.cache_resource(show_spinner="Loading Deep Learning models…")
+def load_dl_models():
+    """Returns (dict name -> KerasTextWrapper, list of log rows)."""
+    out, log = {}, []
+
+    if KerasTextWrapper is None:
+        log.append({"model": "*", "file": "-", "tokenizer": "-", "status": "SKIPPED",
+                    "detail": f"Keras / TensorFlow could not be imported: {KERAS_IMPORT_ERROR}"})
+        return out, log
+
+    for label, spec in DL_SPECS.items():
+        model_files = _collect_files(spec["models"], spec["keywords"], (".h5", ".keras"), spec["exclude"])
+        tok_files = _collect_files(spec["tokenizers"], ("token",), (".pkl", ".json"), spec["exclude"])
+
+        if not model_files:
+            log.append({"model": label, "file": "-", "tokenizer": "-", "status": "MISSING",
+                        "detail": "No .h5/.keras model file found in: " + ", ".join(str(d) for d in SEARCH_DIRS)})
+            continue
+        if not tok_files:
+            log.append({"model": label, "file": model_files[0].name, "tokenizer": "-", "status": "MISSING",
+                        "detail": "No tokenizer (.pkl/.json) found."})
+            continue
+
+        done = False
+        for mp in model_files:
+            try:
+                keras_model = load_model_compat(str(mp))
+            except Exception as e:
+                log.append({"model": label, "file": mp.name, "tokenizer": "-", "status": "FAILED",
+                            "detail": f"model load: {e}"})
+                continue
+
+            for tp in tok_files:
+                try:
+                    tok = load_tokenizer_compat(tp)
+                    wrapper = KerasTextWrapper(keras_model, tok, max_len=200,
+                                               model_path=mp, tokenizer_path=tp)
+                    out[label] = wrapper
+                    log.append({"model": label, "file": mp.name, "tokenizer": tp.name, "status": "OK",
+                                "detail": (f"max_len={wrapper.max_len}, vocab_limit={wrapper.vocab_limit}, "
+                                           f"tokenizer_words={len(tok.word_index)}")})
+                    done = True
+                    break
+                except Exception as e:
+                    log.append({"model": label, "file": mp.name, "tokenizer": tp.name, "status": "FAILED",
+                                "detail": f"tokenizer/validation: {type(e).__name__}: {str(e)[:300]}"})
+            if done:
+                break
+
+    return out, log
+
+# =====================================================================
+# ===== DL-CORE-END ====================================================
+# =====================================================================
 
 def majority_vote_with_thresholds(p_by_model: dict, thr_by_model: dict) -> int:
     votes = [1 if p_by_model[m] >= thr_by_model[m] else 0 for m in p_by_model]
@@ -413,88 +881,55 @@ bert_classifier = load_bert_pipeline()
 # ---------- Load classic ML ----------
 tfidf_vectorizer = joblib.load("tfidf_vectorizer_smote.pkl")
 models = {
-    #"Random Forest": joblib.load("rf_model_smote.pkl"),
+    "Random Forest": joblib.load("rf_model_smote.pkl"),
     "XGBoost": joblib.load("xgb_model_smote.pkl"),
     "Logistic Regression": joblib.load("lr_model_smote.pkl"),
     "SVM": joblib.load("svm_model_smote.pkl"),
     "Naive Bayes": joblib.load("nb_model_smote.pkl"),
 }
 
-# ---------- Load DL (CNN / BiLSTM) ----------
-text_models = {}
-
-def _try_add_text_model(label, model_candidates, tok_candidates, max_len=200):
-    if (KerasTextWrapper is None) or (load_model is None) or (pad_sequences is None):
-        return
-    for mp in model_candidates:
-        if not os.path.exists(mp):
-            continue
-        for tp in tok_candidates:
-            if not os.path.exists(tp):
-                continue
-            try:
-                text_models[label] = KerasTextWrapper(mp, tp, max_len=max_len)
-                return
-            except Exception:
-                continue
-
-_try_add_text_model(
-    "CNN",
-    model_candidates=[
-        "cnn_model_smote_fixed.h5", "cnn_model_smote.h5",
-        "cnn_model_smote_fixed.keras", "cnn_model_smote.keras"
-    ],
-    tok_candidates=[
-        "cnn_tokenizer.pkl", "tokenizer_smote.pkl", "tokenizer_smote.json"
-    ],
-    max_len=200
-)
-
-_try_add_text_model(
-    "BiLSTM",
-    model_candidates=[
-        "lstm_model_smote_fixed.h5", "lstm_model_smote.h5",
-        "lstm_model_smote_fixed.keras", "lstm_model_smote.keras"
-    ],
-    tok_candidates=[
-        "bilstm_tokenizer.pkl", "tokenizer_smote.pkl", "tokenizer_smote.json"
-    ],
-    max_len=200
-)
+# ---------- Load DL (CNN / BiLSTM) — cached, auto-discovered, logged ----------
+text_models, DL_LOAD_LOG = load_dl_models()
 
 analyzer = SentimentIntensityAnalyzer()
 
 # ---------- Persisted label map ----------
 ALIGN_PATH = pathlib.Path("label_map.json")
-if "label_maps" not in st.session_state:
-    def build_label_maps():
-        lm = {n: auto_align_label(m, tfidf_vectorizer) for n, m in models.items()}
-        for n, tm in text_models.items():
-            lm[n] = auto_align_label_textmodel(tm)
-        return lm
 
+def _persist_label_maps():
+    try:
+        ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
+    except Exception:
+        pass
+
+if "label_maps" not in st.session_state:
+    _lm = {}
     if ALIGN_PATH.exists():
         try:
-            st.session_state["label_maps"] = json.loads(ALIGN_PATH.read_text())
-            for n in models:
-                if n not in st.session_state["label_maps"]:
-                    st.session_state["label_maps"][n] = auto_align_label(models[n], tfidf_vectorizer)
-            for n in text_models:
-                if n not in st.session_state["label_maps"]:
-                    st.session_state["label_maps"][n] = auto_align_label_textmodel(text_models[n])
-            ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
+            _lm = json.loads(ALIGN_PATH.read_text())
         except Exception:
-            st.session_state["label_maps"] = build_label_maps()
+            _lm = {}
+    for _n, _m in models.items():
+        if _n not in _lm:
+            _lm[_n] = auto_align_label(_m, tfidf_vectorizer)
+    st.session_state["label_maps"] = _lm
+    _persist_label_maps()
+
+def sync_dl_label_maps():
+    """(Re)computes label alignment of a DL model when it is new or when its files changed."""
+    changed = False
+    for n, tm in text_models.items():
+        cur = st.session_state["label_maps"].get(n)
+        if (not cur) or cur.get("sig") != tm.sig:
             try:
-                ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
+                st.session_state["label_maps"][n] = auto_align_label_textmodel(tm)
+                changed = True
             except Exception:
                 pass
-    else:
-        st.session_state["label_maps"] = build_label_maps()
-        try:
-            ALIGN_PATH.write_text(json.dumps(st.session_state["label_maps"], indent=2))
-        except Exception:
-            pass
+    if changed:
+        _persist_label_maps()
+
+sync_dl_label_maps()
 
 # ---------- Header / login ----------
 if "is_admin" not in st.session_state:
@@ -570,6 +1005,7 @@ if (not is_admin) and (not show_login):
         X = tfidf_vectorizer.transform([text])
 
         per_model_probs, per_model_thrs = {}, {}
+        dl_errors = {}
 
         # ---------- Classic Machine Learning
         for name, model in models.items():
@@ -588,7 +1024,8 @@ if (not is_admin) and (not show_login):
                 p_dep = raw_p if lm["depressed_label"] == 1 else (1.0 - raw_p)
                 per_model_probs[name] = p_dep
                 per_model_thrs[name]  = lm["thr_dep"]
-            except Exception:
+            except Exception as e:
+                dl_errors[name] = f"{type(e).__name__}: {e}"
                 continue
 
         ens_vote  = majority_vote_with_thresholds(per_model_probs, per_model_thrs) if per_model_probs else 0
@@ -640,6 +1077,7 @@ if (not is_admin) and (not show_login):
 
             "per_model_probs": per_model_probs,
             "per_model_thrs": per_model_thrs,
+            "dl_errors": dl_errors,
 
             "ensemble_vote": ens_vote,
             "ensemble_avg_prob": avg_p_dep,
@@ -777,24 +1215,6 @@ elif is_admin:
             f"probes pos_avg={lm.get('pos_avg',0):.2f}, neg_avg={lm.get('neg_avg',0):.2f})"
         )
 
-    #---------- Deep Learning subset table ----------
-    dl_names = [n for n in ["CNN","BiLSTM"] if n in per_probs]
-    if dl_names:
-        st.subheader("🧪 DL Models — probability, threshold & decision")
-        rows = []
-        for name in dl_names:
-            p   = float(per_probs.get(name, 0.0))
-            thr = float(per_thrs.get(name, 0.5))
-            rows.append({
-                "Model": name,
-                "p_dep": round(p, 4),
-                "threshold": round(thr, 4),
-                "Decision": "Depressed 😞" if p >= thr else "Not Depressed 😊"
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-    else:
-        st.info("Deep Learning module: not enabled in this deployment environment. The app runs in ML-only inference mode for maximum compatibility.")
-
     st.subheader("📊 VADER Sentiment")
     scores = data.get("sentiment", {})
     neg = float(scores.get('neg', 0.0))
@@ -890,6 +1310,3 @@ elif is_admin:
         st.caption(info_msg)
     else:
         st.info("Δεν βρέθηκαν λέξεις για 3D απεικόνιση (άδειο ή πολύ μικρό κείμενο).")
-
-
-
